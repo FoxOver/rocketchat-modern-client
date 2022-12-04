@@ -1,5 +1,8 @@
 package com.github.daniel_sc.rocketchat.modern_client;
 
+import com.github.daniel_sc.rocketchat.modern_client.exception.RocketChatClientCloseReasonException;
+import com.github.daniel_sc.rocketchat.modern_client.exception.RocketChatClientException;
+import com.github.daniel_sc.rocketchat.modern_client.exception.SendFailedException;
 import com.github.daniel_sc.rocketchat.modern_client.request.*;
 import com.github.daniel_sc.rocketchat.modern_client.response.*;
 import com.github.daniel_sc.rocketchat.modern_client.response.livechat.InitialData;
@@ -29,6 +32,7 @@ public class RocketChatClient implements AutoCloseable {
             // parse dates from long:
             .registerTypeAdapter(Date.class, (JsonDeserializer<Date>) (json, typeOfT, context) -> new Date(json.getAsJsonPrimitive().getAsLong()))
             .registerTypeAdapter(Date.class, (JsonSerializer<Date>) (date, type, jsonSerializationContext) -> new JsonPrimitive(date.getTime()))
+            .registerTypeAdapter(FullChatMessage.class, new ChatMessageDeserializer())
             .create();
 
     protected final Map<String, CompletableFutureWithMapper<?>> futureResults = new ConcurrentHashMap<>();
@@ -51,14 +55,25 @@ public class RocketChatClient implements AutoCloseable {
         login = login(new LoginParam(user, password));
     }
 
-    public RocketChatClient(String url, LoginParam param) {
+    public RocketChatClient(String url, LoginParam param) throws RocketChatClientException {
         this(url, param, ForkJoinPool.commonPool());
     }
 
-    public RocketChatClient(String url, LoginParam param, Executor executor) {
+    public RocketChatClient(String url, LoginParam param, Executor executor) throws RocketChatClientException {
         this.url = url;
         this.executor = executor;
         login = login(param);
+        try {
+            login.join();
+        } catch (CompletionException e) {
+            try {
+                throw e.getCause();
+            } catch (RocketChatClientException ex) {
+                throw ex;
+            } catch (Throwable throwable) {
+                throw new RuntimeException(throwable);
+            }
+        }
     }
 
     public RocketChatClient(String url, LoginTokenParam param) {
@@ -133,7 +148,7 @@ public class RocketChatClient implements AutoCloseable {
         return login.thenApply(loginResult -> loginResult.id).getNow(null);
     }
 
-    protected CompletableFuture<LoginResult> login(LoginParam param) {
+    public CompletableFuture<LoginResult> login(LoginParam param) {
         return loginBase(param);
     }
 
@@ -166,6 +181,15 @@ public class RocketChatClient implements AutoCloseable {
                     return GSON.fromJson(jsonElement, new TypeToken<List<Room>>() {
                     }.getType());
                 }));
+    }
+
+    public CompletableFuture<DirectMessage> getUserId(String username) {
+        return send(new MethodRequest("createDirectMessage", username),
+                genericAnswer -> {
+                    JsonElement jsonElement = GSON.toJsonTree(genericAnswer.result);
+                    return GSON.fromJson(jsonElement, new TypeToken<DirectMessage>() {
+                    }.getType());
+                });
     }
 
     protected <T> CompletableFuture<T> send(IRequest request, Function<GenericAnswer, T> answerMapper) {
@@ -279,6 +303,10 @@ public class RocketChatClient implements AutoCloseable {
         };
     }
 
+    protected void failMethodLogin(ErrorMessage message) {
+        login.completeExceptionally(new RocketChatClientException(message.message));
+        close();
+    }
 
     /**
      * Subscribes to chat room messages. Subscription is automatically managed,
@@ -329,6 +357,42 @@ public class RocketChatClient implements AutoCloseable {
         return (Observable<T>) subscriptionResults.get(rid).getObservable();
     }
 
+    public Observable<FullChatMessage> streamMessages() {
+        String myMessage = "__my_messages__";
+        subscriptionResults.computeIfAbsent(myMessage, roomId -> {
+            LOG.fine("creating new subscription observable");
+            SubscriptionRequest request = new SubscriptionRequest("stream-room-messages", myMessage, false);
+            PublishSubject<FullChatMessage> subject = PublishSubject.create();
+            Observable<FullChatMessage> observable = subject.doFinally(() -> {
+                LOG.fine("cancelling subscription");
+                subscriptionResults.remove(myMessage);
+                send(new UnsubscribeRequest(request.getId()), failOnError(Function.identity()))
+                        .handleAsync((r, error) -> {
+                            LOG.fine("handling unsubscribe: result=" + r + ", error=" + error);
+                            if (error != null) {
+                                // this happens when client is closed immediately after disposing observer..
+                                LOG.log(Level.FINE, "Failed to unsubscribe: ", error);
+                            }
+                            return r;
+                        }, executor);
+            }).share();
+
+            send(request, failOnError(Function.identity()))
+                    .handleAsync((r, error) -> {
+                        LOG.fine("handling subscribe: result=" + r + ", error=" + error);
+                        if (error != null) {
+                            subject.onError(error);
+                        }
+                        return r;
+                    }, executor);
+
+            return new ObservableSubjectWithMapper<>(subject, observable,
+                    r -> GSON.fromJson(GSON.toJsonTree(r.fields), FullChatMessage.class));
+        });
+        //noinspection unchecked
+        return (Observable<FullChatMessage>) subscriptionResults.get(myMessage).getObservable();
+    }
+
     private static void handleSendResult(SendResult sendResult, CompletableFuture<?> result) {
         if (!sendResult.isOK()) {
             result.completeExceptionally(new SendFailedException(sendResult));
@@ -339,6 +403,7 @@ public class RocketChatClient implements AutoCloseable {
     public void close() {
         LOG.fine("closing client..");
         try {
+            subscriptionResults.clear();
             session.join().close();
         } catch (IOException | CompletionException | CancellationException e) {
             LOG.log(Level.WARNING, "Could not close session: ", e);
@@ -366,7 +431,30 @@ public class RocketChatClient implements AutoCloseable {
                     messageParts.clear();
                 }
 
-                rawMessages.onNext(completeMessage);
+                GenericAnswer msgObject = GSON.fromJson(completeMessage, GenericAnswer.class);
+                if (msgObject.server_id != null) {
+                    LOG.fine("sending connect");
+                    session.join().getAsyncRemote().sendText("{\"msg\": \"connect\",\"version\": \"1\",\"support\": [\"1\"]}",
+                            sendResult -> LOG.fine("connect ack: " + sendResult.isOK()));
+                } else if ("connected".equals(msgObject.msg)) {
+                    connectResult.complete(msgObject.session);
+                } else if (msgObject.error != null) {
+                    failMethodLogin((ErrorMessage) msgObject.error);
+                } else if ("ping".equals(msgObject.msg)) {
+                    session.join().getAsyncRemote().sendText("{\"msg\":\"ping\"}",
+                            result -> LOG.fine("sent pong: " + result.isOK()));
+                } else if (msgObject.id != null && futureResults.containsKey(msgObject.id)) {
+                    boolean complete = futureResults.remove(msgObject.id).completeAndMap(msgObject);
+                    if (!complete) {
+                        LOG.warning("future result was already completed: " + msgObject);
+                    }
+                } else if (msgObject.fields != null
+                        && msgObject.fields.get("eventName") != null
+                        && subscriptionResults.containsKey(msgObject.fields.get("eventName"))) {
+                    subscriptionResults.get(msgObject.fields.get("eventName")).next(msgObject);
+                } else {
+                    LOG.warning("Unhandled message: " + completeMessage);
+                }
 
             } else {
                 synchronized (messageParts) {
@@ -384,14 +472,15 @@ public class RocketChatClient implements AutoCloseable {
                 // this can happen for future results of cancelled subscriptions or pong messages..
                 LOG.fine("terminating open result id=" + id + ", future=" + future +
                         " (you might want to 'join()' some result before closing the client to prevent this)");
-                future.completeExceptionally(new RuntimeException("connection closed: " + closeReason));
+                future.completeExceptionally(new RocketChatClientCloseReasonException(closeReason));
             });
             futureResults.clear();
             subscriptionResults.forEach((id, observerAndMapper) -> {
                 LOG.warning("terminating open subscription id=" + id + ", observable=" + observerAndMapper.getObservable() +
                         " (you might want to dispose all observers before closing the client to prevent this)");
-                observerAndMapper.getSubject().onError(new RuntimeException("connection closed: " + closeReason));
+                observerAndMapper.getSubject().onComplete();
             });
+            subscriptionResults.clear();
         }
 
     }

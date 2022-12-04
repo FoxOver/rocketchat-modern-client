@@ -1,8 +1,6 @@
 package com.github.daniel_sc.rocketchat.modern_client.response;
 
-import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
-import com.google.gson.JsonObject;
 
 import java.util.Map;
 
@@ -13,7 +11,7 @@ public class GenericAnswer {
     public String id;
     public String collection;
     public Map<String, ?> fields;
-    public Map<String, ?> error;
+    public ErrorMessage error;
     public JsonElement result;
 
     @Override
