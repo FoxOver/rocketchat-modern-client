@@ -1,5 +1,6 @@
 package com.github.daniel_sc.rocketchat.modern_client;
 
+import com.github.daniel_sc.rocketchat.modern_client.exception.RocketChatClientException;
 import com.github.daniel_sc.rocketchat.modern_client.request.Attachment;
 import com.github.daniel_sc.rocketchat.modern_client.request.AttachmentField;
 import com.github.daniel_sc.rocketchat.modern_client.request.LoginParam;
@@ -44,7 +45,7 @@ public class RocketChatClientIT {
     private RocketChatClient client;
 
     @Before
-    public void setUp() {
+    public void setUp() throws RocketChatClientException {
         LockSupport.parkNanos(TimeUnit.SECONDS.toNanos(1)); // prevent rate limit..
         client = new RocketChatClient(URL, new LoginParam(USER, PASSWORD), Executors.newFixedThreadPool(2));
     }
@@ -109,6 +110,17 @@ public class RocketChatClientIT {
 
         assertNotNull(msg);
         assertEquals(Collections.emptyMap(), client.futureResults);
+    }
+
+    @Test(timeout = DEFAULT_TIMEOUT)
+    public void testLoadHistory() {
+        LOG.info("start testLoadHistory..");
+        Room room = client.getRooms().thenApply(rooms -> rooms.stream().findFirst().get()).join();
+        List<ChatMessage> msgs = client.loadHistory(room.id, 3).join();
+        for (ChatMessage msg : msgs) {
+            LOG.info(msg.msg);
+        }
+        assertNotNull(msgs);
     }
 
     @Test(timeout = DEFAULT_TIMEOUT)
@@ -238,6 +250,8 @@ public class RocketChatClientIT {
         LOG.info("start testConnectToWrongUrl..");
         try (RocketChatClient c = new RocketChatClient("ws://localhost:3001", new LoginParam(null, null))) {
             fail("Expect client to fail construction!");
+        } catch (RocketChatClientException e) {
+            throw new RuntimeException(e);
         }
     }
 
@@ -256,6 +270,8 @@ public class RocketChatClientIT {
         try (RocketChatClient c = new RocketChatClient(URL, new LoginParam(USER, null))) {
             c.sendMessage("test msg", "1").join();
             fail("Expect client to fail construction!");
+        } catch (RocketChatClientException e) {
+            throw new RuntimeException(e);
         }
     }
 

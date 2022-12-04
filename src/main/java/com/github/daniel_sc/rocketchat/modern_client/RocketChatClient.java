@@ -238,6 +238,12 @@ public class RocketChatClient implements AutoCloseable {
                 }.getType())));
     }
 
+    public CompletableFuture<ChatHistory> loadHistory(String room_id, Integer limit) {
+        return send(new MethodRequest("loadHistory", room_id, null, limit, null),
+                failOnError(r -> GSON.fromJson(GSON.toJsonTree(r.result), ChatHistory.class)));
+    }
+
+
     public CompletableFuture<InitialData> livechatGetInitialData(String visitorToken) {
         MethodRequest request;
         if (visitorToken != null) {
